@@ -26,16 +26,14 @@ from urllib.parse import urlparse, parse_qs, urlunparse
 
 from agent.local_prompt_progress import (
     PromptReadingClock, current_prompt_reading_hook, prompt_progress, prompt_reading_hook, with_prompt_progress)
+from agent import auxiliary_error_policy as aux_errors
 from agent.error_classifier import (
-    _BILLING_PATTERNS,
-    _OVERLOADED_PATTERNS, FailoverReason, classify_api_error,
+    FailoverReason,
     UNSUPPORTED_PARAM_MARKERS,
     is_reasoning_field_rejection,
     is_reasoning_required_rejection,
 )
-from agent.auxiliary_error_shapes import (
-    _botocore_error, _exc_http_status, _is_invalid_aux_response_error, _is_statusless_structured_provider_error,
-)
+from agent.errors import InvalidProviderResponseError
 from agent.auxiliary_managed_local import _is_managed_local_endpoint
 from agent.auxiliary_reasoning_floor import remember_reasoning_floor, with_reasoning_floor
 from agent.auxiliary_structured_output import _route_key, _without_structured_output_format, remember_structured_output_rejection
@@ -376,7 +374,7 @@ def _anthropic_event_has_content(event: Any) -> bool:
 def _anthropic_aux_stream_event_hook() -> Callable[[Any], None]:
     """Per-event callback for the Anthropic aux wire: progress only for substantive payloads
     (keepalives must not keep a stalled summary alive), stop at the host deadline or explicit
-    cancel. The ``TimeoutError`` text must say "timed out" so ``_is_timeout_error`` classifies it."""
+    cancel. A ``TimeoutError`` classifies as a full-budget timeout."""
     host_deadline = _current_aux_stream_deadline()
     started = time.monotonic()
 
@@ -1251,6 +1249,12 @@ class _CodexStreamGuard:
         with self._deadline_lock:
             self._progress_deadline = time.monotonic() + self.no_progress_timeout
 
+    def timeout_error(self) -> TimeoutError:
+        """A zero-output first-token failure is typed so the same-provider retry stays allowed."""
+        from agent.auxiliary_stream_watchdog import AuxNoProgressTimeout
+        no_progress = time.monotonic() < self.hard_deadline and not self.saw_content.is_set()
+        return (AuxNoProgressTimeout if no_progress else TimeoutError)(self.timeout_message())
+
     def timeout_message(self) -> str:
         elapsed = time.monotonic() - self._start
         if time.monotonic() >= self.hard_deadline:
@@ -1317,7 +1321,7 @@ class _CodexStreamGuard:
         if self.total_timeout is not None and time.monotonic() >= self.effective_deadline():
             if not self.timed_out.is_set():
                 self._close_client_on_timeout()
-            raise TimeoutError(self.timeout_message())
+            raise self.timeout_error()
         try:
             from tools.interrupt import is_interrupted
             # Protected atomic aux tasks (compression) must not abort on a mid-flight gateway
@@ -1597,7 +1601,9 @@ class _CodexCompletionsAdapter:
                     tc.function.name = wire_aliases[tc.function.name]
         except Exception as exc:
             if guard.timed_out.is_set():
-                raise TimeoutError(guard.timeout_message()) from exc
+                # The deadline is the verdict: the stream's own close error must not classify the attempt.
+                logger.debug("Codex auxiliary Responses stream closed by its deadline: %s", exc)
+                raise guard.timeout_error() from None
             logger.debug("Codex auxiliary Responses API call failed: %s", exc)
             raise
         finally:
@@ -3179,31 +3185,6 @@ def _contains_any(text: str, needles: tuple[str, ...]) -> bool:
     return any(kw in text for kw in needles)
 
 
-# Billing-body markers (credit exhaustion wrapped in 402/403/404/429 bodies). The main classifier's
-# ``_BILLING_PATTERNS`` is the single source (#107166: the two lists had drifted, so OpenRouter's org
-# "Budget limit exceeded" / "Key limit exceeded" 403s were billing for the main loop but not for the aux
-# ladder, and aux fallback never fired); the aux list only adds broader phrasings and daily/weekly quota
-# exhaustion (functionally credit exhaustion; "resource exhausted" is the Vertex/gRPC quota phrasing —
-# also serialized by SDK wrappers and NIM as RESOURCE_EXHAUSTED / ResourceExhausted / resource-exhausted).
-_PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
-    "credits", "insufficient funds", "can only afford", "billing",
-    "isn't available on the free tier", "key limit exceeded", "budget limit",
-    "requires a subscription", "upgrade for access", "upgrade for higher limits",
-    "reached your session usage limit", "quota exceeded", "quota_exceeded",
-    "too many tokens per day", "daily limit", "tokens per day", "daily quota", "resource exhausted",
-    "resource_exhausted", "resource-exhausted", "resourceexhausted",
-    "weekly usage limit", "weekly limit",
-)
-
-
-def _is_payment_error(exc: Exception) -> bool:
-    """Payment/credit/quota exhaustion: HTTP 402, or a billing/quota body on 403/404/429/no-status."""
-    status = getattr(exc, "status_code", None)
-    return status == 402 or (
-        status in {403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
-    )
-
-
 def _nous_portal_account_has_fresh_paid_access() -> bool:
     """Return True only when the fresh Nous account API says paid access is allowed."""
     try:
@@ -3212,78 +3193,6 @@ def _nous_portal_account_has_fresh_paid_access() -> bool:
     except Exception as exc:
         logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
         return False
-
-
-_RATE_LIMIT_KEYWORDS = (
-    "rate limit", "rate_limit", "too many requests", "try again", "retry after", "resets in"
-)
-_RATE_LIMIT_BILLING_KEYWORDS = (
-    "credits", "insufficient funds", "billing", "payment required", "can only afford",
-    "out of funds", "run out of funds", "balance_depleted", "no usable credits",
-    "model_not_supported_on_free_tier", "not available on the free tier", "isn't available on the free tier",
-)
-
-
-def _is_overloaded_error(exc: Exception) -> bool:
-    """Server busy, credential fine ("at capacity upstream … not your API key's rate limit"): back off,
-    never bench the credential (#108349). Same phrase table as the main classifier."""
-    return _contains_any(str(exc).lower(), _OVERLOADED_PATTERNS)
-
-
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """429 rate limit (not billing/quota, which _is_payment_error owns).
-
-    OpenAI's RateLimitError may omit .status_code — matched by class name. A generic 429 without
-    billing keywords counts as a rate limit.
-    """
-    # (PR #8023 pattern)
-    if type(exc).__name__ == "RateLimitError" or _botocore_error(exc)[1] == "ThrottlingException":
-        return True
-    if _exc_http_status(exc) != 429:
-        return False
-    err_lower = str(exc).lower()
-    return _contains_any(err_lower, _RATE_LIMIT_KEYWORDS) or not _contains_any(err_lower, _RATE_LIMIT_BILLING_KEYWORDS)
-
-
-def _is_timeout_error(exc: Exception) -> bool:
-    """Full-budget request timeout, distinct from a fast connection drop.
-
-    A timeout burns the whole ``timeout`` budget, so a same-provider retry on the compression
-    path doubles wall time; fast drops stay on the retry path.
-    """
-    with contextlib.suppress(ImportError):
-        from openai import APITimeoutError
-        if isinstance(exc, APITimeoutError):
-            return True
-    return "Timeout" in type(exc).__name__ or "timed out" in str(exc).lower()
-
-
-def _is_connection_error(exc: Exception) -> bool:
-    """Connection/network errors (endpoint unreachable), as opposed to 4xx/5xx API errors."""
-    with contextlib.suppress(ImportError):
-        from openai import APIConnectionError, APITimeoutError
-        if isinstance(exc, (APIConnectionError, APITimeoutError)):
-            return True
-    if _contains_any(type(exc).__name__, ("Connection", "Timeout", "DNS", "SSL")):
-        return True
-    return _contains_any(str(exc).lower(), (
-        "connection refused", "name or service not known", "no route to host",
-        "network is unreachable", "timed out", "connection reset",
-        # httpcore/httpx premature stream close — transient, retry/reroute.
-        "incomplete chunked read", "peer closed connection", "response ended prematurely",
-        "unexpected eof", "remoteprotocolerror", "localprotocolerror",
-    ))
-
-
-def _is_transient_transport_error(exc: Exception) -> bool:
-    """One-off transport blip worth retrying on the SAME provider: connection/stream-close errors plus pure 5xx/408.
-
-    Deliberately narrow: payment/auth/rate-limit errors switch provider, refresh creds, or rotate the pool.
-    """
-    if _is_connection_error(exc):
-        return True
-    status = _exc_http_status(exc)
-    return isinstance(status, int) and (status == 408 or 500 <= status < 600)
 
 
 _DEFAULT_TRANSIENT_RETRIES = 2
@@ -3299,18 +3208,6 @@ def _transient_retry_count() -> int:
         return _DEFAULT_TRANSIENT_RETRIES if val is None else max(0, min(int(val), 6))
     except Exception:
         return _DEFAULT_TRANSIENT_RETRIES
-
-
-def _is_auth_error(exc: Exception) -> bool:
-    """Auth failures that should trigger provider-specific refresh."""
-    status = getattr(exc, "status_code", None)
-    if status == 401:
-        return True
-    err_lower = str(exc).lower()
-    if "error code: 401" in err_lower or "authenticationerror" in type(exc).__name__.lower():
-        return True
-    # xAI returns 403 "unauthenticated:bad-credentials" for expired OAuth tokens — semantically a 401.
-    return "bad-credentials" in err_lower and (status == 403 or "unauthenticated" in err_lower)
 
 
 def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
@@ -3394,70 +3291,6 @@ def _without_reasoning_fields(kwargs: dict) -> Optional[dict]:
                 retry_kwargs.pop("extra_body", None)
             changed = True
     return retry_kwargs if changed else None
-
-
-def _is_model_not_found_error(exc: Exception) -> bool:
-    """"Requested model doesn't exist" (404 / invalid model) — typically a long-lived process pinned a
-    since-dropped model. Excludes billing keywords, which :func:`_is_payment_error` owns."""
-    status = getattr(exc, "status_code", None)
-    err_lower = str(exc).lower()
-    if _contains_any(err_lower, (
-        "credits", "insufficient funds", "billing", "out of funds", "balance_depleted",
-        "no usable credits", "free tier", "free-tier", "not available on the free tier",
-    )):
-        return False
-    if status not in {404, 400, None}:
-        return False
-    return _contains_any(err_lower, (
-        "model does not exist", "does not exist in our configuration", "openrouter catalog",
-        "is not a valid model", "no such model", "model not found",
-        "the model `",            # OpenAI-style: "The model `X` does not exist"
-        "model_not_found", "unknown model",
-    ))
-
-
-def _is_model_incompatible_error(exc: Exception) -> bool:
-    """"This route cannot serve this model" 400 (capability mismatch, e.g. a Codex/ChatGPT-account
-    fallback asked to run a non-OpenAI model). Auth/payment predicates don't fire, so this keeps the
-    chain going instead of aborting. Excludes billing 400s and not-found 400s."""
-    status = getattr(exc, "status_code", None)
-    if status not in {400, None}:
-        return False
-    err_lower = str(exc).lower()
-    if _is_model_not_found_error(exc):
-        return False
-    # Billing keywords checked directly: _is_payment_error is status-gated and misses 400-coded billing bodies.
-    if _contains_any(err_lower, (
-        "credits", "insufficient funds", "billing", "out of funds", "balance_depleted",
-        "no usable credits", "payment required", "free tier", "free-tier",
-        "not available on the free tier", "model_not_supported_on_free_tier", "quota",
-    )):
-        return False
-    return _contains_any(err_lower, (
-        "is not supported when using",   # codex/ChatGPT-account model gating
-        "model is not supported", "not supported with this", "not supported for this account",
-        "model_not_supported", "does not support this model", "unsupported model",
-    ))
-
-
-# Tasks on a user-visible critical path (compression blocks resuming an oversized session; vision
-# stalls the serialised turn queue). A same-provider retry after a full-budget timeout costs another
-# whole ``timeout`` window, so they skip straight to fallback; fast blips still retry.
-# Fast blips (a streaming-close or a 5xx) still retry, since those are cheap. See issue #54465 for the
-# compression case. Title generation joins them because its retries multiplied the user's
-# ``auxiliary.title_generation.timeout`` (~4x: three full windows plus backoff) on a slow local
-# model, and the auto-title thread outlived the deadline the user thought they had set (#89445, #66251).
-_TIMEOUT_NO_RETRY_TASKS = frozenset({"compression", "vision", "title_generation"})
-
-
-def _should_skip_same_provider_retry(task: Optional[str], exc: Exception) -> bool:
-    """True when a transient error on a critical-path task should go straight to fallback.
-
-    Carve-out: a fast first-token fail (dead stream within the no-progress window, zero output —
-    see ``_timeout_message``) is cheap and keeps the same-provider retry; mid-stream stalls and
-    hard-ceiling timeouts skip to fallback.
-    """
-    return task in _TIMEOUT_NO_RETRY_TASKS and _is_timeout_error(exc) and "no-progress timeout" not in str(exc)
 
 
 def _evict_cached_clients(provider: str) -> None:
@@ -3620,7 +3453,9 @@ def _recoverable_pool_provider(
     return None
 
 
-def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
+def _recover_provider_pool(
+    provider: str, exc: Exception, *, failed_api_key: str = "", verdict: Any = None,
+) -> bool:
     """Try same-provider credential-pool recovery for auxiliary calls.
 
     ``failed_api_key`` lets mark_exhausted_and_rotate identify the right pool entry even if
@@ -3634,31 +3469,38 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
         return False
     if not pool or not pool.has_credentials():
         return False
-    status_code = getattr(exc, "status_code", None)
+    # The ladder's verdict when it classified for this provider, else one for the pool's provider.
+    if verdict is None or verdict.provider != normalized:
+        verdict = aux_errors.classify_attempt(exc, normalized)
+    status_code = verdict.status_code
+    # Account gating of one model: the key is benched for that model only.
+    gated = verdict.reason is FailoverReason.model_entitlement
 
     def _rotate(fallback_status: int) -> bool:
         error_context: dict[str, Any] = {"message": str(exc)}
         if status_code is not None:
             error_context["status_code"] = status_code
         next_entry = pool.mark_exhausted_and_rotate(
-            status_code=status_code if status_code is not None else fallback_status,
+            # A 400-coded billing wall or throttle benches the key like its canonical status would.
+            status_code=fallback_status if status_code in (None, 400) else status_code,
             error_context=error_context, api_key_hint=failed_api_key or None,
+            **({"failure_reason": verdict.reason.value, "model": verdict.model or None} if gated else {}),
         )
         if next_entry is None:
             return False
         _evict_cached_clients(normalized)
         return True
 
-    if _is_auth_error(exc):
+    if aux_errors.auth_refresh(verdict):
         if pool.try_refresh_current() is not None:
             _evict_cached_clients(normalized)
             return True
         return _rotate(401)
-    if _is_payment_error(exc):
-        return _rotate(402)
-    # An upstream model throttle (OpenRouter-wrapped, OpenCode Go "Upstream request failed") leaves the key healthy.
-    upstream = classify_api_error(exc, provider=normalized).reason is FailoverReason.upstream_rate_limit
-    return _rotate(429) if _is_rate_limit_error(exc) and not _is_overloaded_error(exc) and not upstream else False
+    # An overloaded server or an upstream model throttle (OpenRouter-wrapped, OpenCode Go "Upstream request
+    # failed") leaves the key healthy: the verdict does not ask for rotation.
+    if not verdict.should_rotate_credential:
+        return False
+    return _rotate(402 if aux_errors.benches_provider(verdict) else 400 if gated else 429)
 
 
 def _prepare_same_provider_retry(
@@ -3984,7 +3826,7 @@ def _quarantine_fallback_candidate(
     task: Optional[str], fb_label: str, fb_provider: str, fb_err: Exception, *,
     base_url: str = "", tag: str = "", reason: Optional[str] = None,
 ) -> None:
-    """The candidate cannot serve this walk (``reason`` = its ``_FALLBACK_REASONS`` capacity label,
+    """The candidate cannot serve this walk (``reason`` = its ``aux_errors.fallback_label``,
     None = dead token): mark it unhealthy so the ordered re-walk skips it and the caller moves on to
     the next entry. Transient classes get a short hold, payment/quota and dead tokens the long one."""
     _mark_provider_unhealthy(
@@ -4016,16 +3858,53 @@ def _plan_fallback_auth_retry(
     return fb_provider, None
 
 
+def _fallback_candidate_ladder(
+    fb_client: Any, fb_kwargs: dict[str, Any], destination: _FallbackDestination,
+    rebuild: Callable[[str, Any, Optional[str]], tuple[_FallbackDestination, dict[str, Any]]], *,
+    task: Optional[str], fb_label: str, tag: str, async_mode: bool,
+):
+    """One fallback candidate (generator, for ``_drive_ladder`` / ``_drive_ladder_async``): each ``attempt``
+    step sends with the parameter rungs and returns ``(response, failure, rung_spent)``. A refreshable auth
+    failure refreshes the credential and sends once more; one no refresh fixed quarantines the candidate as
+    a stale credential. Any other final failure another candidate could avoid (capacity, transport, a gated
+    or missing model, a malformed answer, a non-refreshable auth refusal, a request the candidate's own
+    parameter repair changed) quarantines it under its own label and returns None so the ordered chain
+    advances (#106367); the request's own failure re-raises."""
+    resp, failure, spent = yield _LadderStep("attempt", (fb_client, fb_kwargs, destination))
+    fb_provider, base_url = destination.provider, destination.base_url
+    if failure is not None and aux_errors.auth_refresh(failure.verdict):
+        fb_provider, retry = _plan_fallback_auth_retry(
+            destination, rebuild, async_mode=async_mode, failed_api_key=getattr(fb_client, "api_key", ""))
+        if retry is not None:
+            base_url = retry[2].base_url
+            resp, failure, spent = yield _LadderStep("attempt", retry)
+        if failure is not None and (retry is None or aux_errors.auth_refresh(failure.verdict)):
+            _quarantine_fallback_candidate(task, fb_label, fb_provider, failure.error, base_url=base_url, tag=tag)
+            return None
+    if failure is None:
+        return resp
+    reason = fallback_candidate_unavailable_reason(failure, rung_spent=spent)
+    if reason is None:
+        raise failure.error
+    _quarantine_fallback_candidate(
+        task, fb_label, fb_provider, failure.error, base_url=base_url, tag=tag, reason=reason)
+    return None
+
+
+def _candidate_classification_provider(fb_client: Any, fb_model: Optional[str], fb_label: str,
+                                       task: Optional[str]) -> str:
+    """The backend a candidate's failures classify against (so its profile hook applies): the client's
+    auto-routed provider tag, else its destination's provider, never a display label."""
+    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    return _fallback_provider_from_label(_effective_provider_for_client(fb_client, destination.provider))
+
+
 def _call_fallback_candidate_sync(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
 ) -> Optional[Any]:
-    """Call one fallback candidate with stale-credential recovery: on an auth error refresh its
-    credentials and retry once with a rebuilt client; if that also auth-fails, quarantine the
-    provider and return None so the caller moves on. A capacity error (quota/rate-limit 429, 402,
-    connection, route-incompatible model, malformed response) also quarantines and returns None so
-    the ordered chain advances to the next configured entry (#106367); other errors raise.
+    """Call one fallback candidate with stale-credential recovery (``_fallback_candidate_ladder``).
 
     ``effective_timeout`` is the task-level deadline; a configured-chain candidate with its own ``timeout``
     entry gets that instead, so a fallback tuned differently from the primary is allowed its own budget
@@ -4037,6 +3916,7 @@ def _call_fallback_candidate_sync(
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
     )
+    provider = _candidate_classification_provider(fb_client, fb_model, fb_label, task)
 
     def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
         return _validate_llm_response(
@@ -4051,48 +3931,31 @@ def _call_fallback_candidate_sync(
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs
 
-    def _send_recovering(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
+    def _attempt(step: _LadderStep) -> Any:
+        client, request_kwargs, dest = step.args
         return send_with_parameter_rungs(
-            lambda c, kw: _send(c, kw, dest), client, request_kwargs, task=task)
-    try:
-        return _send_recovering(fb_client, fb_kwargs, destination)
-    except Exception as fb_err:
-        if not _is_auth_error(fb_err):
-            capacity = fallback_candidate_unavailable_reason(fb_err)
-            if capacity is None:
-                raise
-            _quarantine_fallback_candidate(
-                task, fb_label, destination.provider, fb_err, base_url=destination.base_url,
-                reason=capacity)
-            return None
-        fb_provider, retry = _plan_fallback_auth_retry(
-            destination, rebuild, async_mode=False, failed_api_key=getattr(fb_client, "api_key", ""))
-        failed_destination = destination
-        if retry is not None:
-            failed_destination = retry[2]
-            try:
-                return _send_recovering(*retry)
-            except Exception as retry_err:
-                if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
-                    raise
-        _quarantine_fallback_candidate(
-            task, fb_label, fb_provider, fb_err, base_url=failed_destination.base_url,
-        )
-        return None
+            lambda c, kw: _send(c, kw, dest), client, request_kwargs, task=task, provider=provider,
+            base_url=dest.base_url)
+    return _drive_ladder(_fallback_candidate_ladder(
+        fb_client, fb_kwargs, destination, rebuild, task=task, fb_label=fb_label, tag="", async_mode=False),
+        _attempt)
 
 
 async def _call_fallback_candidate_async(
     fb_client: Any, fb_model: Optional[str], fb_label: str, *, task: Optional[str], messages: list,
     temperature: Optional[float], max_tokens: Optional[int], tools: Optional[list],
     effective_timeout: float, effective_extra_body: dict, reasoning_config: Optional[dict],
+    classify_as: Optional[str] = None,
 ) -> Optional[Any]:
-    """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire)."""
+    """Async mirror of :func:`_call_fallback_candidate_sync` (no fast-lane cap on this wire).
+    ``classify_as``: the backend of the sync client ``fb_client`` was converted from."""
     destination, fb_kwargs, rebuild = _plan_fallback_candidate(
         fb_client, fb_model, fb_label, task=task, effective_timeout=effective_timeout,
         apply_fast_lane=False, messages=messages, tools=tools, temperature=temperature,
         max_tokens=max_tokens, effective_extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
     )
+    provider = classify_as or _candidate_classification_provider(fb_client, fb_model, fb_label, task)
 
     async def _send(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
         import asyncio
@@ -4103,35 +3966,14 @@ async def _call_fallback_candidate_async(
         )
     from agent.auxiliary_fallback_recovery import send_with_parameter_rungs_async
 
-    async def _send_recovering(client: Any, request_kwargs: dict[str, Any], dest: _FallbackDestination) -> Any:
+    async def _attempt(step: _LadderStep) -> Any:
+        client, request_kwargs, dest = step.args
         return await send_with_parameter_rungs_async(
-            lambda c, kw: _send(c, kw, dest), client, request_kwargs, task=task)
-    try:
-        return await _send_recovering(fb_client, fb_kwargs, destination)
-    except Exception as fb_err:
-        if not _is_auth_error(fb_err):
-            capacity = fallback_candidate_unavailable_reason(fb_err)
-            if capacity is None:
-                raise
-            _quarantine_fallback_candidate(
-                task, fb_label, destination.provider, fb_err, base_url=destination.base_url,
-                tag=" (async)", reason=capacity)
-            return None
-        fb_provider, retry = _plan_fallback_auth_retry(
-            destination, rebuild, async_mode=True, failed_api_key=getattr(fb_client, "api_key", ""))
-        failed_destination = destination
-        if retry is not None:
-            failed_destination = retry[2]
-            try:
-                return await _send_recovering(*retry)
-            except Exception as retry_err:
-                if not _is_auth_error(retry_err) and fallback_candidate_unavailable_reason(retry_err) is None:
-                    raise
-        _quarantine_fallback_candidate(
-            task, fb_label, fb_provider, fb_err,
-            base_url=failed_destination.base_url, tag=" (async)",
-        )
-        return None
+            lambda c, kw: _send(c, kw, dest), client, request_kwargs, task=task, provider=provider,
+            base_url=dest.base_url)
+    return await _drive_ladder_async(_fallback_candidate_ladder(
+        fb_client, fb_kwargs, destination, rebuild, task=task, fb_label=fb_label, tag=" (async)",
+        async_mode=True), _attempt)
 
 
 def _try_payment_fallback(
@@ -6717,13 +6559,13 @@ def _validate_llm_response(
     except (AttributeError, TypeError, IndexError) as exc:
         recovered = _recover_aux_response_message(response)
         if recovered is None:
-            invalid = RuntimeError(
+            invalid = InvalidProviderResponseError(
                 f"Auxiliary {task or 'call'}: LLM returned invalid response (type={type(response).__name__}): "
                 f"{str(response)[:120]!r}. Expected object with .choices[0].message — check provider "
                 f"adapter or custom endpoint compatibility."
             )
             # An HTTP-200 body carrying a provider ``error`` (aggregators relay upstream failures
-            # this way): keep it for the classifier without changing how the ladder routes this.
+            # this way): keep it for telemetry; the ladder routes every such answer as incomplete_response.
             from agent import auxiliary_call_outcome
             setattr(invalid, auxiliary_call_outcome.PROVIDER_ERROR_ATTR,
                     auxiliary_call_outcome.embedded_provider_error(response))
@@ -6929,9 +6771,8 @@ _AFFORDABLE_RETRY_MARGIN_TOKENS = 64
 def _affordable_max_tokens_from_error(exc: Exception) -> Optional[int]:
     """Affordable output budget (minus margin) from an OpenRouter credit-limited 402
     ("...but can only afford 7117": credit exists, the cap was too large); ``None``
-    when no count is present or the budget is too small to be useful."""
-    if not _is_payment_error(exc):
-        return None
+    when no count is present or the budget is too small to be useful. Callers also require a
+    billing verdict (the main loop's ``classified.reason``, ``_create_with_progress`` here)."""
     match = _AFFORDABLE_TOKENS_RE.search(str(exc))
     if not match:
         return None
@@ -6952,20 +6793,30 @@ def _create_with_progress(
         return _create_with_progress_once(client, kwargs, task, force_stream=force_stream)
     except Exception as exc:
         affordable = _affordable_max_tokens_from_error(exc)
-        if affordable is None:
+        if affordable is None or not aux_errors.benches_provider(_attempt_verdict(client, kwargs, exc)):
             raise
         existing_cap = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
         if isinstance(existing_cap, (int, float)) and 0 < existing_cap <= affordable:
             raise  # Already within budget — the error is something else; don't spin.
-        retry_kwargs = dict(kwargs)
-        retry_kwargs.pop("max_tokens", None)
-        retry_kwargs.pop("max_completion_tokens", None)
-        retry_kwargs.update(
-            auxiliary_max_tokens_param(affordable, model=str(kwargs.get("model") or "") or None))
-        logger.info("Auxiliary %s: credit-limited 402 (affordable=%d tokens); "
-                    "retrying once with a clamped output cap instead of failing: %s",
-                    task or "call", affordable, exc)
-        return _create_with_progress_once(client, retry_kwargs, task, force_stream=force_stream)
+        rejection = exc
+    # Re-sent once the 402 is handled, so the clamped retry's own failure never carries it as context.
+    retry_kwargs = dict(kwargs)
+    retry_kwargs.pop("max_tokens", None)
+    retry_kwargs.pop("max_completion_tokens", None)
+    retry_kwargs.update(auxiliary_max_tokens_param(affordable, model=str(kwargs.get("model") or "") or None))
+    logger.info("Auxiliary %s: credit-limited 402 (affordable=%d tokens); "
+                "retrying once with a clamped output cap instead of failing: %s",
+                task or "call", affordable, rejection)
+    return _create_with_progress_once(client, retry_kwargs, task, force_stream=force_stream)
+
+
+def _attempt_verdict(client: Any, kwargs: dict[str, Any], exc: Exception) -> Any:
+    """The verdict for a failure inside one attempt (stream negotiation, the affordable-402 clamp), on
+    the endpoint, credential and model ``client`` sent."""
+    return aux_errors.classify_attempt(exc, _effective_provider_for_client(client, ""), client, kwargs.get("model"))
+
+
+_STREAM_REJECTED = object()  # the stream negotiation failed: re-send the request non-streaming
 
 
 def _stream_request_plan(kwargs: dict[str, Any], client: Any = None) -> tuple[dict[str, Any], str, float]:
@@ -7016,13 +6867,14 @@ def _create_with_progress_once(
     except Exception as exc:
         # Genuine provider failures aren't streaming's fault — surface unchanged so the
         # recovery chains see the same error as a plain call.
-        if (force_stream or _is_transient_transport_error(exc) or _is_auth_error(exc)
-                or _is_payment_error(exc) or _is_rate_limit_error(exc)):
+        if force_stream or aux_errors.stream_negotiation_reraises(_attempt_verdict(client, kwargs, exc)):
             raise
-        # Possibly a streaming-specific rejection: retry non-streaming once; a genuinely bad
-        # request reproduces the real error for the except-chains.
+        # Possibly a streaming-specific rejection: retry non-streaming once (after the handler, so its
+        # own failure is classified as itself); a genuinely bad request reproduces the real error.
         logger.debug("Auxiliary %s: streamed request failed (%s); retrying non-streaming",
                      task or "call", exc)
+        chunks = _STREAM_REJECTED
+    if chunks is _STREAM_REJECTED:
         _notify_aux_dispatch()
         response = client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
@@ -7041,8 +6893,8 @@ def _aggregate_chat_stream(
     chunks: Any, *, model: str = "", total_ceiling: Optional[float] = None,
     no_progress: Optional[tuple[float, Optional[float]]] = None,
 ) -> Any:
-    """Consume a chunk stream into a complete response; TimeoutError (phrased "timed out" so
-    ``_is_timeout_error`` matches) past *total_ceiling* or the *no_progress* windows (#100501)."""
+    """Consume a chunk stream into a complete response; TimeoutError past *total_ceiling* or the
+    *no_progress* windows (#100501)."""
     from agent.auxiliary_stream_watchdog import _close_chunk_stream, consume_chat_stream
     acc = _ChatStreamAccumulator(
         model=model, total_ceiling=total_ceiling, host_deadline=_current_aux_stream_deadline)
@@ -7248,11 +7100,12 @@ async def _acreate_with_progress(
         # Only a rejected stream NEGOTIATION falls back to a plain call (mirrors the sync wrapper); a
         # failure mid-consumption below reaches the classified recovery ladder instead of silently
         # re-sending the whole prompt non-streaming.
-        if (force_stream or _is_transient_transport_error(exc) or _is_auth_error(exc)
-                or _is_payment_error(exc) or _is_rate_limit_error(exc)):
+        if force_stream or aux_errors.stream_negotiation_reraises(_attempt_verdict(client, kwargs, exc)):
             raise
         logger.debug("Auxiliary %s: streamed async request failed (%s); retrying non-streaming",
                      task or "call", exc)
+        chunks = _STREAM_REJECTED
+    if chunks is _STREAM_REJECTED:
         _notify_aux_dispatch()
         response = await client.chat.completions.create(**kwargs)
         _notify_aux_provider_response()
@@ -7417,6 +7270,23 @@ def _prepare_aux_request(
         effective_extra_body, base_info)
 
 
+def _outcome(call: Callable[..., Any], *args: Any, **kwargs: Any) -> tuple[Any, Optional[Exception]]:
+    """``(result, None)`` or ``(None, error)``, so the caller handles a failure after its ``except`` ends
+    and a retry's own failure never carries the previous one as implicit context."""
+    try:
+        return call(*args, **kwargs), None
+    except Exception as exc:  # health: allow BLE001 -- returned to the caller, which classifies and re-raises it
+        return None, exc
+
+
+async def _aoutcome(awaitable: Any) -> tuple[Any, Optional[Exception]]:
+    """Async :func:`_outcome`."""
+    try:
+        return await awaitable, None
+    except Exception as exc:  # health: allow BLE001 -- returned to the caller, which classifies and re-raises it
+        return None, exc
+
+
 class _LadderStep(NamedTuple):
     """A provider request the ladder asks its driver to perform. kind: "call" (client, kwargs) |
     "retry_same_provider" (provider, model) | "fallback" (fb_client, fb_model, fb_label)."""
@@ -7424,51 +7294,45 @@ class _LadderStep(NamedTuple):
     args: tuple
 
 
-# Ordered (predicate, reason) pairs for the provider-fallback rung: first match
-# wins, so a payment-flavoured 429 reads as "payment error", not "rate limit".
-_FALLBACK_REASONS: tuple[tuple[Callable[[Exception], bool], str], ...] = (
-    (_is_auth_error, "auth error"), (_is_payment_error, "payment error"),
-    (_is_rate_limit_error, "rate limit"), (_is_model_incompatible_error, "model incompatible with route"),
-    (_is_invalid_aux_response_error, "invalid provider response"),
-    # A status-less in-stream ``error`` event (SSE committed 200) is a route failure (#101538).
-    (_is_statusless_structured_provider_error, "structured provider error"),
-    # Before the connection-error rung (its superset): a full-budget timeout must be named as one, or
-    # a slow local model reads as an unreachable endpoint (#89445).
-    (_is_timeout_error, "request timed out"), (_is_connection_error, "connection error"),
-)
-
-
-def _rung(step: _LadderStep, accept: Callable[[Exception], bool]):
-    """One ladder rung: perform ``step``; yields ``(response, None)`` on success,
-    ``(None, exc)`` when ``accept(exc)`` lets the next rung handle it, else re-raises."""
+def _rung(step: _LadderStep, accept: Callable[[aux_errors.Failure], bool], route: "_LadderRoute"):
+    """One ladder rung: perform ``step``; yields ``(response, None)`` on success, ``(None, failure)`` when
+    ``accept(failure)`` lets the next rung handle it (classified once, on the step's own request), else
+    re-raises."""
     try:
         result = yield step
     except Exception as exc:
-        if not accept(exc):
+        failure = _failure(route, exc, step)
+        if not accept(failure):
             raise
-        return None, exc
+        return None, failure
     return result, None
 
 
-def _param_rung_accepts(exc: Exception) -> bool:
-    """After a parameter-strip retry: fall through to the max_tokens/payment/auth
-    chains with the stripped kwargs; re-raise anything those chains won't handle.
-    A 429 on the retry is the credential/provider-fallback rungs' job, so it falls
-    through too (the pre-ladder max_tokens rung accepted rate limits)."""
-    return (_is_payment_error(exc) or _is_connection_error(exc) or _is_auth_error(exc)
-            or _is_rate_limit_error(exc) or _is_statusless_structured_provider_error(exc)
-            or "max_tokens" in str(exc) or "unsupported_parameter" in str(exc)
-            # Parameter rungs chain in any order (a reasoning-strip retry can 400 on temperature,
-            # a temperature-strip retry on max_tokens), and a route-gating 400 after a strip still
-            # reaches the provider-fallback rung.
-            or _is_unsupported_parameter_error(exc, "temperature")
-            or _is_reasoning_field_rejection(exc) or _is_reasoning_required_rejection(exc)
-            or _is_structured_output_rejection(exc)
-            or _is_model_incompatible_error(exc))
+def _classify_failure(exc: Exception, provider: Optional[str], client: Any, model: Any,
+                      base_url: Optional[str]) -> aux_errors.Failure:
+    """Classify one failed request once, on the backend, client and model it was sent with, and note
+    whether a parameter rung's detector names the rejected field."""
+    provider = _fallback_provider_from_label(_effective_provider_for_client(client, provider or ""))
+    verdict = aux_errors.classify_attempt(exc, provider, client, model, base_url)
+    return aux_errors.Failure(exc, verdict, any(rung[0](exc) for rung in _parameter_rungs(client, 0)))
 
 
-def _credential_rung_accepts(exc: Exception) -> bool:
-    return _is_auth_error(exc) or _is_payment_error(exc) or _is_rate_limit_error(exc)
+def _failure(route: "_LadderRoute", exc: Any, step: Optional[_LadderStep] = None) -> aux_errors.Failure:
+    """:func:`_classify_failure` for a ladder step (a ``call`` step's own client and model: a refreshed
+    Nous client, a healed model); an already classified failure passes through."""
+    if isinstance(exc, aux_errors.Failure):
+        return exc
+    client, model = route.client, route.final_model
+    if step is not None and step.kind == "call":
+        client, model = step.args[0], step.args[1].get("model") or model
+    return _classify_failure(exc, route.resolved_provider, client, model, route.base_info or route.resolved_base_url)
+
+
+def _param_rung_accepts(failure: aux_errors.Failure) -> bool:
+    """After a parameter-strip retry: the next rung for another rejected field (rungs chain in any order:
+    a reasoning-strip retry can 400 on temperature, a temperature-strip retry on max_tokens), or anything
+    the credential/fallback rungs act on now that the request was changed once."""
+    return failure.rejects_parameter or aux_errors.ladder_accepts(failure, rung_spent=True)
 
 
 # Immutable route context shared by the recovery rungs.
@@ -7539,28 +7403,28 @@ def _parameter_rungs(client: Any, max_tokens: Optional[int]) -> tuple:
 
 
 def _ladder_parameter_rungs(
-    first_err: Exception, route: _LadderRoute, kwargs: dict[str, Any], max_tokens: Optional[int],
+    failure: aux_errors.Failure, route: _LadderRoute, kwargs: dict[str, Any], max_tokens: Optional[int],
 ):
     """Parameter rungs: retry without temperature / structured-output format / reasoning field /
     max_tokens. Rungs chain in whichever order the provider raises them (reasoning models reject
     temperature AND max_tokens; a reasoning-strip retry can then trip temperature, #78273), each
     field stripped at most once, so a request with N rejected fields recovers in N retries.
-    Returns ``(response, None, kwargs)`` or ``(None, narrowed_err, stripped_kwargs)``."""
+    Returns ``(response, None, kwargs)`` or ``(None, narrowed_failure, stripped_kwargs)``; ``stripped_kwargs``
+    is the caller's own ``kwargs`` object when no rung ran (callers read ``is not kwargs`` as rung spent)."""
     client, task, tag = route.client, route.task, route.tag
     rungs = list(_parameter_rungs(client, max_tokens))
     while rungs:
         hit = next((rung for rung in rungs
-                    if rung[0](first_err) and rung[1](kwargs) is not None), None)
+                    if rung[0](failure.error) and rung[1](kwargs) is not None), None)
         if hit is None:
             break
         rungs.remove(hit)
         _matches, strip, message, remember = hit
         retry_kwargs = strip(kwargs)
-        logger.info("Auxiliary %s%s: %s: %s", task or "call", tag, message, first_err)
-        rejection = first_err
-        resp, first_err = yield from _rung(
-            _LadderStep("call", (client, retry_kwargs)), _param_rung_accepts)
-        if first_err is None:
+        logger.info("Auxiliary %s%s: %s: %s", task or "call", tag, message, failure.error)
+        rejection = failure.error
+        resp, failure = yield from _rung(_LadderStep("call", (client, retry_kwargs)), _param_rung_accepts, route)
+        if failure is None:
             if remember is not None:
                 # Same key _build_call_kwargs looks up (base_info or resolved_base_url), so the
                 # memory hits when the client exposes no base_url but the task resolved one.
@@ -7568,7 +7432,7 @@ def _ladder_parameter_rungs(
                          kwargs, rejection)
             return resp, None, retry_kwargs
         kwargs = retry_kwargs
-    return None, first_err, kwargs
+    return None, failure, kwargs
 
 
 def _refreshed_nous_step(route: _LadderRoute, kwargs: dict[str, Any], message: str) -> Optional[_LadderStep]:
@@ -7589,14 +7453,14 @@ def _refreshed_nous_step(route: _LadderRoute, kwargs: dict[str, Any], message: s
 
 
 def _ladder_nous_rungs(
-    first_err: Exception, route: _LadderRoute, kwargs: dict[str, Any], client_is_nous: bool,
+    failure: aux_errors.Failure, route: _LadderRoute, kwargs: dict[str, Any], client_is_nous: bool,
 ):
     """Nous-only rungs: stale-model self-heal, paid-account refresh, 401 refresh.
-    Returns ``(response, None)`` or ``(None, first_err)`` to fall through."""
+    Returns ``(response, None)`` or ``(None, failure)`` to fall through."""
     client, task, tag = route.client, route.task, route.tag
     # A long-lived process can pin a Portal model since dropped from the catalog (every call
     # 404s); force a fresh Portal fetch and retry once.
-    if _is_model_not_found_error(first_err) and client_is_nous:
+    if failure.verdict.reason is FailoverReason.model_not_found and client_is_nous:
         healed_model = _refresh_nous_recommended_model(
             vision=(task == "vision"), stale_model=kwargs.get("model"))
         if healed_model and healed_model != kwargs.get("model"):
@@ -7604,39 +7468,37 @@ def _ladder_nous_rungs(
                            "retrying with refreshed recommendation %r",
                            task or "call", tag, kwargs.get("model"), healed_model)
             kwargs["model"] = healed_model
-            resp, first_err = yield from _rung(_LadderStep("call", (client, kwargs)), lambda exc: True)
-            if first_err is None:
+            resp, failure = yield from _rung(_LadderStep("call", (client, kwargs)), lambda _f: True, route)
+            if failure is None:
                 return resp, None
     # Auth refresh parity with the main agent.
-    if _is_payment_error(first_err) and client_is_nous and _nous_portal_account_has_fresh_paid_access():
+    if aux_errors.benches_provider(failure.verdict) and client_is_nous and _nous_portal_account_has_fresh_paid_access():
         step = _refreshed_nous_step(
             route, kwargs,
             "Auxiliary %s%s: refreshed Nous runtime credentials after paid account check, retrying")
         if step is not None:
-            resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
-            if first_err is None:
+            resp, failure = yield from _rung(step, aux_errors.ladder_accepts, route)
+            if failure is None:
                 return resp, None
-    if _is_auth_error(first_err) and client_is_nous:
+    if aux_errors.auth_refresh(failure.verdict) and client_is_nous:
         step = _refreshed_nous_step(
             route, kwargs, "Auxiliary %s%s: refreshed Nous runtime credentials after 401, retrying")
         if step is not None:
-            resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
-            if first_err is None:
+            resp, failure = yield from _rung(step, aux_errors.ladder_accepts, route)
+            if failure is None:
                 return resp, None
-    return None, first_err
+    return None, failure
 
 
 def _ladder_credential_rungs(
-    first_err: Exception, route: _LadderRoute, kwargs: dict[str, Any], client_is_nous: bool,
+    failure: aux_errors.Failure, route: _LadderRoute, kwargs: dict[str, Any], client_is_nous: bool,
 ):
     """OAuth credential refresh + same-provider retry, then credential-pool rotation.
-    Returns ``(response, None)`` or ``(None, first_err)`` to fall through."""
+    Returns ``(response, None)`` or ``(None, failure)`` to fall through."""
     client, task, tag, resolved_provider = route.client, route.task, route.tag, route.resolved_provider
     auth_refresh_provider = _auth_refresh_provider_for_route(
         resolved_provider, route.base_info, _effective_provider_for_client(client, ""))
-    if (_is_auth_error(first_err) and auth_refresh_provider not in {"auto", "", None}
+    if (aux_errors.auth_refresh(failure.verdict) and auth_refresh_provider not in {"auto", "", None}
             and not client_is_nous):
         refresh_kwargs = ({"failed_api_key": getattr(client, "api_key", "")}
                           if auth_refresh_provider == "anthropic" else {})
@@ -7650,45 +7512,41 @@ def _ladder_credential_rungs(
             step = _LadderStep(
                 "retry_same_provider",
                 (auth_refresh_provider, route.resolved_model or route.final_model))
-            resp, first_err = yield from _rung(
-                step, lambda exc: _credential_rung_accepts(exc) or _is_connection_error(exc))
-            if first_err is None:
+            resp, failure = yield from _rung(step, aux_errors.ladder_accepts, route)
+            if failure is None:
                 return resp, None
-            # ``first_err`` is now the retry's own failure, not the original auth error: the
-            # pool gate below and the ladder tail's eviction check both read this narrowed
-            # value. An unclaimed failure (e.g. a 500) re-raised out of ``_rung`` above
-            # instead, since the provider-fallback rung only acts on ``_FALLBACK_REASONS``.
+            # ``failure`` is now the retry's own, not the original auth error: the pool gate below
+            # and the ladder tail's eviction check both read this narrowed value. A failure no later
+            # rung acts on (``aux_errors.ladder_accepts``) re-raised out of ``_rung`` above instead.
     pool_provider = _recoverable_pool_provider(resolved_provider, client, main_runtime=route.main_runtime)
     # Capture the exact key used so recovery finds the right pool entry even if another
     # process rotated the pool meanwhile (current() would be None).
     _client_api_key = str(getattr(client, "api_key", "") or "")
     # Gate on the narrowed error: a connection failure from the retry above arrives here
     # unaccepted on purpose (a fresh key cannot fix an unreachable endpoint), so rotation
-    # is skipped and ``first_err`` is handed to the provider-fallback chain as-is.
-    if pool_provider and _credential_rung_accepts(first_err):
-        recovery_err = first_err
-        # No backoff retry for a payment/quota error: the same exhausted key stays refused.
-        if _is_rate_limit_error(first_err) and not _is_payment_error(first_err):
+    # is skipped and ``failure`` is handed to the provider-fallback chain as-is.
+    if pool_provider and failure.verdict.should_rotate_credential:
+        # No backoff retry for a payment/quota error: the same exhausted key stays refused. The last
+        # backoff failure replaces the 429 for pool recovery and the fallback decision (a 429 then a
+        # generic 403 is a 403).
+        if aux_errors.same_key_retry(failure.verdict):
             from agent.auxiliary_rate_limit_backoff import rate_limit_retry_rungs
-            resp, recovery_err = yield from rate_limit_retry_rungs(first_err, client, kwargs, f"{task or 'call'}{tag}")
-            if recovery_err is None:
+            resp, failure = yield from rate_limit_retry_rungs(failure, route, kwargs)
+            if failure is None:
                 return resp, None
-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+        if _recover_provider_pool(pool_provider, failure.error, failed_api_key=_client_api_key,
+                                  verdict=failure.verdict):
             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
-                        task or "call", tag, pool_provider, type(recovery_err).__name__)
-            try:
-                return (yield _LadderStep(
-                    "retry_same_provider", (resolved_provider, route.resolved_model))), None
-            except Exception as retry2_err:
-                # Rotated key also hit a wall: mark it now so concurrent processes skip it,
-                # then fall through to the provider fallback.
-                if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
-                        or _is_rate_limit_error(retry2_err)):
-                    _recover_provider_pool(pool_provider, retry2_err)
-                    first_err = retry2_err
-                else:
-                    raise
-    return None, first_err
+                        task or "call", tag, pool_provider, type(failure.error).__name__)
+            step = _LadderStep("retry_same_provider", (resolved_provider, route.resolved_model))
+            resp, failure = yield from _rung(step, aux_errors.ladder_accepts, route)
+            if failure is None:
+                return resp, None
+            # Rotated key also hit a wall: mark it now so concurrent processes skip it,
+            # then fall through to the provider fallback.
+            if failure.verdict.should_rotate_credential:
+                _recover_provider_pool(pool_provider, failure.error, verdict=failure.verdict)
+    return None, failure
 
 
 def _next_fallback_after_quarantine(
@@ -7716,25 +7574,20 @@ def _next_fallback_after_quarantine(
     return fb
 
 
-def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
+def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, *, rung_spent: bool = False):
     """Last rung: other providers (per-task chain; then auto: main fallback chain + discovery
     chain, explicit: main-agent-model net). Returns the response or None.
-    Capacity errors (payment/quota, connection, exhausted 429, model incompatible, malformed
-    response) bypass the explicit-provider gate — the provider cannot serve this request
-    regardless of user intent. Auth errors from an explicit provider may only use the task's
-    own configured fallback_chain; they never imply an unconfigured provider hop."""
-    task, tag, resolved_provider = route.task, route.tag, route.resolved_provider
-    # Respect explicit provider choice for transient errors (auth, request validation, etc.) but fall back when
-    # the provider cannot serve due to capacity: payment/quota exhaustion (a daily-token 429 like a 402, #26803),
-    # connection failures, and a 429 after retries are exhausted (#52228) are not request constraints.
+    Every fallback label except auth bypasses the explicit-provider gate: the provider cannot serve
+    this request regardless of user intent. An auth error from an explicit provider may only use the
+    task's own configured fallback_chain; it never implies an unconfigured provider hop."""
+    task, tag, resolved_provider, first_err = route.task, route.tag, route.resolved_provider, failure.error
     is_auto = resolved_provider in {"auto", "", None}
-    reason = next((label for predicate, label in _FALLBACK_REASONS if predicate(first_err)), None)
-    is_capacity_error = any(
-        predicate(first_err) for predicate, label in _FALLBACK_REASONS if label != "auth error")
+    reason = aux_errors.fallback_label(failure, rung_spent=rung_spent)
+    is_capacity_error = reason not in (None, aux_errors.AUTH_ERROR)
     task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
     has_task_fallback_chain = isinstance(task_chain, list) and bool(task_chain)
     explicit_auth_with_task_chain = (
-        reason == "auth error" and not is_auto and has_task_fallback_chain
+        reason == aux_errors.AUTH_ERROR and not is_auto and has_task_fallback_chain
     )
     if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
         return None
@@ -7827,20 +7680,23 @@ def _aux_recovery_ladder(
         client, task, tag, async_mode, base_info, resolved_provider, resolved_model,
         resolved_base_url, resolved_api_key, resolved_api_mode, final_model, main_runtime, route_info,
         kwargs.get("timeout"))
-    resp, first_err, kwargs = yield from _ladder_parameter_rungs(first_err, route, kwargs, max_tokens)
-    if first_err is None:
+    resp, failure, stripped = yield from _ladder_parameter_rungs(
+        _failure(route, first_err), route, kwargs, max_tokens)
+    if failure is None:
         return resp
+    rung_spent, kwargs = stripped is not kwargs, stripped
     client_is_nous = (resolved_provider == "nous"
                       or base_url_host_matches(base_info, "inference-api.nousresearch.com"))
-    resp, first_err = yield from _ladder_nous_rungs(first_err, route, kwargs, client_is_nous)
-    if first_err is None:
+    resp, failure = yield from _ladder_nous_rungs(failure, route, kwargs, client_is_nous)
+    if failure is None:
         return resp
-    resp, first_err = yield from _ladder_credential_rungs(first_err, route, kwargs, client_is_nous)
-    if first_err is None:
+    resp, failure = yield from _ladder_credential_rungs(failure, route, kwargs, client_is_nous)
+    if failure is None:
         return resp
-    resp = yield from _ladder_provider_fallback(first_err, route)
+    resp = yield from _ladder_provider_fallback(failure, route, rung_spent=rung_spent)
     if resp is not None:
         return resp
+    first_err = failure.error
     # Connection/timeout errors poison the cached client (closed transport, half-read
     # stream); evict so the next aux call rebuilds a fresh one.
     # Reached only when no fallback answered, so the next auxiliary call rebuilds a fresh
@@ -7848,7 +7704,7 @@ def _aux_recovery_ladder(
     # rungs above, not necessarily the original one. See issue #23432.
     # Mirror the sync path: drop poisoned clients on connection/timeout so the next aux call rebuilds. See
     # issue #23432.
-    if _is_connection_error(first_err):
+    if failure.verdict.error_context.get("transport"):
         try:
             _evict_cached_client_instance(client)
         except Exception:
@@ -7860,34 +7716,30 @@ def _aux_recovery_ladder(
 
 
 def _drive_ladder(ladder, perform: Callable[[_LadderStep], Any]) -> Any:
-    """Run a ladder generator, feeding each step's result (or exception) back in; a ``wait`` step sleeps."""
-    try:
-        step = next(ladder)
-        while True:
-            try:
-                result = time.sleep(step.args[0]) if step.kind == "wait" else perform(step)
-            except Exception as exc:
-                step = ladder.throw(exc)
-            else:
-                step = ladder.send(result)
-    except StopIteration as stop:
-        return stop.value
+    """Run a ladder generator, feeding each step's result (or exception) back in; a ``wait`` step sleeps.
+    The ladder resumes outside the driver's ``except``, so a later rung's failure never carries an earlier
+    one as its context."""
+    resume, value = ladder.send, None
+    while True:
+        try:
+            step = resume(value)
+        except StopIteration as stop:
+            return stop.value
+        value, exc = _outcome(time.sleep, step.args[0]) if step.kind == "wait" else _outcome(perform, step)
+        resume, value = (ladder.send, value) if exc is None else (ladder.throw, exc)
 
 
 async def _drive_ladder_async(ladder, perform: Callable[[_LadderStep], Any]) -> Any:
     """Async twin of :func:`_drive_ladder` (``perform`` is awaited)."""
     import asyncio
-    try:
-        step = next(ladder)
-        while True:
-            try:
-                result = await (asyncio.sleep(step.args[0]) if step.kind == "wait" else perform(step))
-            except Exception as exc:
-                step = ladder.throw(exc)
-            else:
-                step = ladder.send(result)
-    except StopIteration as stop:
-        return stop.value
+    resume, value = ladder.send, None
+    while True:
+        try:
+            step = resume(value)
+        except StopIteration as stop:
+            return stop.value
+        value, exc = await _aoutcome(asyncio.sleep(step.args[0]) if step.kind == "wait" else perform(step))
+        resume, value = (ladder.send, value) if exc is None else (ladder.throw, exc)
 
 
 def _elapsed_ms(started_at: float, now: Optional[float] = None) -> int:
@@ -7998,17 +7850,22 @@ def _plan_aux_call(
     return req, retry_kwargs, candidate_kwargs
 
 
-def _should_retry_same_provider(task: Optional[str], exc: Exception, tag: str) -> bool:
-    """True when ``exc`` is a transient transport blip worth a same-provider retry; critical-path
-    tasks skip it on a full-budget timeout (``_should_skip_same_provider_retry``) and go straight
+def _should_retry_same_provider(task: Optional[str], failure: aux_errors.Failure, tag: str) -> bool:
+    """True when the failure is a transient blip worth a same-provider retry; critical-path tasks
+    skip it on a full-budget timeout (``aux_errors.skip_same_provider_retry``) and go straight
     to fallback."""
-    if not _is_transient_transport_error(exc):
+    if not aux_errors.same_provider_retry(failure.verdict):
         return False
-    if _should_skip_same_provider_retry(task, exc):
+    if aux_errors.skip_same_provider_retry(task, failure):
         logger.info("Auxiliary %s%s: timeout on the critical path; "
-                    "skipping same-provider retry and falling back: %s", task, tag, exc)
+                    "skipping same-provider retry and falling back: %s", task, tag, failure.error)
         return False
     return True
+
+
+def _primary_failure(req: _PreparedAuxRequest, exc: Exception) -> aux_errors.Failure:
+    return _classify_failure(exc, req.resolved_provider, req.client, req.final_model,
+                             req.base_info or req.resolved_base_url)
 
 
 def _ladder_step_call(
@@ -8024,7 +7881,7 @@ def _ladder_step_call(
 
 
 def _start_recovery_ladder(
-    first_err: Exception, req: _PreparedAuxRequest, retry_kwargs: dict[str, Any], *,
+    first_err: aux_errors.Failure, req: _PreparedAuxRequest, retry_kwargs: dict[str, Any], *,
     task: Optional[str], async_mode: bool, route_info: Optional[dict[str, str]],
 ):
     """Build the recovery-ladder generator for a failed primary request."""
@@ -8093,41 +7950,40 @@ def _call_llm_impl(
             ),
             task, **validate_kw,
         )
-    try:
-        # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for
-        # transient blips before escalating to fallback — a dropped connection shouldn't
-        # abandon a healthy provider (matters for pinned MoA advisors).
-        try:
-            return _primary(provider=request_provider, base_url=req.base_info)
-        except Exception as transient_err:
-            if not _should_retry_same_provider(task, transient_err, ""):
-                raise
-            _max_transient_retries = _transient_retry_count()
-            _last_transient = transient_err
-            for _attempt in range(1, _max_transient_retries + 1):
-                _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
-                logger.info("Auxiliary %s: transient transport error (attempt %d/%d); "
-                            "retrying same provider after %.1fs before fallback: %s",
-                            task or "call", _attempt, _max_transient_retries, _backoff, _last_transient)
-                time.sleep(_backoff)
-                try:
-                    return _primary()
-                except Exception as retry_transient:
-                    if not _is_transient_transport_error(retry_transient):
-                        raise
-                    _last_transient = retry_transient
-            raise _last_transient
-    except Exception as first_err:
-        def _perform(step: _LadderStep) -> Any:
-            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
-            if kind == "retry":
-                return _retry_same_provider_sync(**kw)
-            return _call_fallback_candidate_sync(*args, **kw)
-        return _drive_ladder(
-            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
-            _perform)
+    # Each failure is classified once and handled after its ``except`` ends, so a retry's own failure
+    # never carries the previous one as context.
+    resp, exc = _outcome(_primary, provider=request_provider, base_url=req.base_info)
+    if exc is None:
+        return resp
+    failure = _primary_failure(req, exc)
+    # Bounded same-provider retry (exponential backoff, auxiliary.transient_retries) for transient blips
+    # before escalating to fallback — a dropped connection shouldn't abandon a healthy provider (matters
+    # for pinned MoA advisors).
+    if _should_retry_same_provider(task, failure, ""):
+        _max_transient_retries = _transient_retry_count()
+        for _attempt in range(1, _max_transient_retries + 1):
+            _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
+            logger.info("Auxiliary %s: transient transport error (attempt %d/%d); "
+                        "retrying same provider after %.1fs before fallback: %s",
+                        task or "call", _attempt, _max_transient_retries, _backoff, failure.error)
+            time.sleep(_backoff)
+            resp, exc = _outcome(_primary)
+            if exc is None:
+                return resp
+            failure = _primary_failure(req, exc)
+            if not aux_errors.same_provider_retry(failure.verdict):
+                break
+
+    def _perform(step: _LadderStep) -> Any:
+        kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+        if kind == "call":
+            return _validate_llm_response(_relay_sync_completion(*args, **kw), task)
+        if kind == "retry":
+            return _retry_same_provider_sync(**kw)
+        return _call_fallback_candidate_sync(*args, **kw)
+    return _drive_ladder(
+        _start_recovery_ladder(failure, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
+        _perform)
 
 
 def _coerce_llm_message(response):
@@ -8240,42 +8096,46 @@ async def _async_call_llm_impl(
         extra_headers=None, api_mode=None, route_info=route_info,
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
-    try:
-        # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()).
-        # (PR #16587)
-        _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
+    _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
 
-        async def _acreate(_kwargs: dict[str, Any]) -> Any:
-            return await _acreate_with_progress(client, _kwargs, task, force_stream=_force_stream_async)
+    async def _acreate(_kwargs: dict[str, Any]) -> Any:
+        return await _acreate_with_progress(client, _kwargs, task, force_stream=_force_stream_async)
 
-        async def _primary(**validate_kw: Any) -> Any:
+    async def _primary(**validate_kw: Any) -> Any:
+        import asyncio
+        return await asyncio.to_thread(
+            _validate_llm_response,
+            await _relay_async_completion(
+                client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
+                create=_acreate),
+            task, **validate_kw)
+    # Retry ONCE on the same provider for a transient blip before fallback (see call_llm()); each failure
+    # is classified once and handled after its ``except`` ends. (PR #16587)
+    resp, exc = await _aoutcome(_primary(provider=request_provider, base_url=req.base_info))
+    if exc is None:
+        return resp
+    failure = _primary_failure(req, exc)
+    # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
+    if _should_retry_same_provider(task, failure, " (async)"):
+        logger.info("Auxiliary %s (async): transient transport error; retrying "
+                    "once on the same provider before fallback: %s", task or "call", failure.error)
+        resp, exc = await _aoutcome(_primary())
+        if exc is None:
+            return resp
+        failure = _primary_failure(req, exc)
+
+    async def _perform(step: _LadderStep) -> Any:
+        kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
+        if kind == "call":
             import asyncio
-            return await asyncio.to_thread(
-                _validate_llm_response,
-                await _relay_async_completion(
-                    client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode,
-                    create=_acreate),
-                task, **validate_kw)
-        try:
-            return await _primary(provider=request_provider, base_url=req.base_info)
-        except Exception as transient_err:
-            # The async Codex adapter wraps the sync stream via to_thread: same TimeoutError here.
-            if not _should_retry_same_provider(task, transient_err, " (async)"):
-                raise
-            logger.info("Auxiliary %s (async): transient transport error; retrying "
-                        "once on the same provider before fallback: %s", task or "call", transient_err)
-            return await _primary()
-    except Exception as first_err:
-        async def _perform(step: _LadderStep) -> Any:
-            kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)
-            if kind == "call":
-                import asyncio
-                return await asyncio.to_thread(_validate_llm_response, await _relay_async_completion(*args, **kw), task)
-            if kind == "retry":
-                return await _retry_same_provider_async(**kw)
-            fb_client, fb_model, fb_label = args
-            fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
-            return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, **kw)
-        return await _drive_ladder_async(
-            _start_recovery_ladder(first_err, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
-            _perform)
+            return await asyncio.to_thread(_validate_llm_response, await _relay_async_completion(*args, **kw), task)
+        if kind == "retry":
+            return await _retry_same_provider_async(**kw)
+        fb_client, fb_model, fb_label = args
+        # The converted client drops the sync client's route tags: classify on the sync client's backend.
+        classify_as = _candidate_classification_provider(fb_client, fb_model, fb_label, task)
+        fb_client, _ = _to_async_client(fb_client, fb_model or "", is_vision=(task == "vision"))
+        return await _call_fallback_candidate_async(fb_client, fb_model, fb_label, classify_as=classify_as, **kw)
+    return await _drive_ladder_async(
+        _start_recovery_ladder(failure, req, retry_kwargs, task=task, async_mode=True, route_info=route_info),
+        _perform)

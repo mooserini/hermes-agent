@@ -243,7 +243,9 @@ class TestCompressionRetryGate:
         return result, primary_client, mock_fb
 
     def test_no_progress_timeout_retries_same_provider(self):
-        err = TimeoutError(
+        from agent.auxiliary_stream_watchdog import AuxNoProgressTimeout
+
+        err = AuxNoProgressTimeout(
             "Codex auxiliary Responses stream produced no output within "
             "60.0s (no-progress timeout, 60.2s elapsed)"
         )

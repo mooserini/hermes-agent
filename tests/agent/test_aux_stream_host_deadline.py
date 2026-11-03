@@ -116,8 +116,8 @@ def test_streamed_summary_stops_at_an_elapsed_host_deadline():
         with pytest.raises(TimeoutError) as excinfo:
             aux._aggregate_chat_stream(stream, model="m", total_ceiling=2400.0)
 
-    # "timed out" keeps _is_timeout_error classification identical to a
-    # request timeout, so the existing recovery chains are unchanged.
+    # A TimeoutError classifies as a full-budget timeout, like a request
+    # timeout, so the existing recovery chains are unchanged.
     assert "timed out" in str(excinfo.value)
     # Stopped on the first frame instead of draining the whole stream, and the
     # HTTP response was closed rather than left dangling.

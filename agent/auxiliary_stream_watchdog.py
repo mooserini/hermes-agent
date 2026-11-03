@@ -11,11 +11,19 @@ so the pool drops the dead connection instead of recycling it.
 from __future__ import annotations
 
 import inspect
+import logging
 import threading
 from types import SimpleNamespace
 from typing import Any, Optional
 
 from agent.sleep_clock import awake_seconds
+
+logger = logging.getLogger(__name__)
+
+
+class AuxNoProgressTimeout(TimeoutError):
+    """Zero output within the first-token window: a cheap, fast failure, so critical-path tasks keep
+    the same-provider retry (``auxiliary_error_policy.skip_same_provider_retry``)."""
 
 
 def _stream_socket(stream: Any) -> Any:
@@ -122,11 +130,11 @@ class ChatStreamWatchdog:
             timer.cancel()
 
     def timeout_error(self) -> TimeoutError:
-        """Zero-output stalls say "no-progress timeout" (same-provider retry stays allowed, see
-        ``_should_skip_same_provider_retry``); a mid-stream stall goes straight to fallback."""
+        """A zero-output stall is an ``AuxNoProgressTimeout`` (same-provider retry stays allowed); a
+        mid-stream stall goes straight to fallback."""
         elapsed = awake_seconds() - self._started
         if not self.saw_progress:
-            return TimeoutError(
+            return AuxNoProgressTimeout(
                 f"Auxiliary chat stream produced no output within {self.first_token_window or 0:.1f}s "
                 f"(no-progress timeout, {elapsed:.1f}s elapsed)")
         return TimeoutError(
@@ -175,7 +183,9 @@ def consume_chat_stream(chunks: Any, acc: Any, no_progress: Optional[tuple[float
         if not watchdog.fired:
             raise
         if not acc.finish_reason:
-            raise watchdog.timeout_error() from exc
+            # The deadline is the verdict: the stream's own close error must not classify the attempt.
+            logger.debug("Auxiliary chat stream closed by its watchdog: %s", exc)
+            raise watchdog.timeout_error() from None
     finally:
         watchdog.finish()
     if watchdog.fired and not acc.finish_reason:

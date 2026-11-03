@@ -355,7 +355,7 @@ class TestAggregateChatStream:
         """#100501: an endpoint that sends one chunk then goes silent fails at the task's no-progress
         window as a timeout (so retry/fallback run), not at the request read timeout. Recovery rungs
         go through the default relay callback and must keep the task's window."""
-        from agent.auxiliary_client import _should_skip_same_provider_retry
+        from agent.auxiliary_error_policy import Failure, classify_attempt, skip_same_provider_retry
 
         _gates, call = sse
         started = time.monotonic()
@@ -363,7 +363,7 @@ class TestAggregateChatStream:
             call("m", "compression", via_relay_seam=via_relay_seam)
         assert time.monotonic() - started < 5.0
         assert "stalled: no new output for 0.4s" in str(excinfo.value)
-        assert _should_skip_same_provider_retry("compression", excinfo.value)
+        assert skip_same_provider_retry("compression", Failure(excinfo.value, classify_attempt(excinfo.value, "")))
 
     @pytest.mark.parametrize("case", ["reasoning_before_first_token", "provider_stale_timeout_before_first_token",
                                       "stall_after_terminal_usage", "late_timer_after_pool_reuse"])

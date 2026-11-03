@@ -296,6 +296,8 @@ class PluginDispatchMixin:
                             failed: Optional[list] = None) -> list[Any]:
         """:meth:`invoke_hook`'s loop over ``callbacks``; each one that raised or timed out is
         appended to ``failed`` when given."""
+        if not callbacks:  # nothing registered: skip the timeout lookup (a config read per call)
+            return []
         from hermes_cli.plugins import _resolve_hook_callback_timeout
         results: list[Any] = []
         timeout = _resolve_hook_callback_timeout()
