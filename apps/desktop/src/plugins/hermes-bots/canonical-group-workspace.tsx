@@ -7,6 +7,7 @@ import { CanonicalGroupHeader } from './canonical-group-header'
 import { type CanonicalGroupEvent, CanonicalGroupHistory } from './canonical-group-history'
 import { useCanonicalGroupLabels } from './canonical-group-labels'
 import { forgetCanonicalGroup } from './canonical-group-registry'
+import { CanonicalGroupRoomSettings } from './canonical-group-room-settings'
 import { prepareCanonicalGroupSend, readCanonicalGroupSend, retireCanonicalGroupSend } from './canonical-group-send'
 import type { PreparedCanonicalGroupSend } from './canonical-group-send'
 import { actCanonicalGroup, canonicalGroupRequest } from './canonical-groups'
@@ -166,17 +167,6 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   const rename = (name: string) =>
     void mutate(() => canonicalGroupRequest(binding, 'groups.rename', { room_id: binding.roomId, event_id: randomUuid(), name }))
 
-  // True only once the backend accepted it, so the settings form keeps a rejected draft.
-  const saveContext = async (context: CanonicalRoomContext) => {
-    let saved = false
-    await mutate(async () => {
-      await canonicalGroupRequest(binding, 'groups.context', { room_id: binding.roomId, event_id: randomUuid(), ...context })
-      saved = true
-    })
-
-    return saved
-  }
-
   // Rejects so ConfirmDialog stays open with the error; a disbanded room no longer reads back, so leave it.
   const end = async () => {
     await canonicalGroupRequest(binding, 'groups.disband', { room_id: binding.roomId, cancel_id: randomUuid() })
@@ -201,9 +191,9 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   }
 
   return <section className="flex h-full min-h-0 flex-col gap-3 p-3">
-    <CanonicalGroupHeader busy={busy} canStop={!!state?.driver_status} context={state?.context ?? undefined}
-      deliveryTarget={`room:${binding.roomId}${binding.profile ? `@${binding.profile}` : ''}`} onBack={onBack} onDisband={end} onRename={rename} onSaveContext={saveContext}
+    <CanonicalGroupHeader busy={busy} canStop={!!state?.driver_status} onBack={onBack} onDisband={end} onRename={rename}
       onStop={() => void mutate(() => canonicalGroupRequest(binding, 'groups.stop', { room_id: binding.roomId, cancel_id: randomUuid() }))} phases={phases} room={state?.room} />
+    <CanonicalGroupRoomSettings binding={binding} context={state?.context} disabled={busy} onSaved={refresh} />
     {readError && <div role="alert">{readError}<Button onClick={() => void refresh().catch(e => setReadError(String(e)))}>{labels.refresh}</Button></div>}
     {error && <div role="alert">{error}</div>}
     {state && !state.driver_status && <p>{labels.driverUnavailable}</p>}
