@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react'
 
 import { type CanonicalGroupAttachment, CanonicalGroupAttachments, fetchCanonicalGroupAttachment } from './canonical-group-attachments'
 import { useCanonicalGroupLabels } from './canonical-group-labels'
+import { ASSIGNMENT_EVENT_KIND, CanonicalGroupAssignmentRow } from './canonical-group-lead'
 import type { CanonicalGroupBinding, CanonicalRoomMember } from './canonical-groups'
 
 const MessageTextContent = typeof sdk === 'undefined' ? undefined : sdk.MessageTextContent
@@ -171,6 +172,7 @@ export function CanonicalGroupHistory({ binding, events, members = [], disabled 
   ])
 
   return <>{events.map(event => {
+    if (event.kind === ASSIGNMENT_EVENT_KIND) {return <CanonicalGroupAssignmentRow event={event} key={event.seq} members={members} />}
     const notice = event.kind === 'room.activity' && event.payload.status === 'bounded'
       ? labels.workLimitReached : notices.get(event.kind)
 

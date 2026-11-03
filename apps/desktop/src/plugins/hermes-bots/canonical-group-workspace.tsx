@@ -193,7 +193,7 @@ function CanonicalRoomView({ binding: initialBinding, visible, onBack }: {
   return <section className="flex h-full min-h-0 flex-col gap-3 p-3">
     <CanonicalGroupHeader busy={busy} canStop={!!state?.driver_status} onBack={onBack} onDisband={end} onRename={rename}
       onStop={() => void mutate(() => canonicalGroupRequest(binding, 'groups.stop', { room_id: binding.roomId, cancel_id: randomUuid() }))} phases={phases} room={state?.room} />
-    <CanonicalGroupRoomSettings binding={binding} context={state?.context} disabled={busy} onSaved={refresh} />
+    <CanonicalGroupRoomSettings binding={binding} context={state?.context} disabled={busy} members={state?.room.members} onSaved={refresh} />
     {readError && <div role="alert">{readError}<Button onClick={() => void refresh().catch(e => setReadError(String(e)))}>{labels.refresh}</Button></div>}
     {error && <div role="alert">{error}</div>}
     {state && !state.driver_status && <p>{labels.driverUnavailable}</p>}

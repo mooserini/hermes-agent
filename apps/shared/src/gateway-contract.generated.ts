@@ -1659,6 +1659,8 @@ export interface PeerRouteStatus {
 export interface RoomContext {
   purpose: string
   notes: string
+  routing?: 'everyone' | 'lead'
+  lead_member_id?: string
 }
 export interface GroupsSendParams {
   profile?: string | null
@@ -1687,6 +1689,8 @@ export interface GroupsContextParams {
   event_id: string
   purpose: string
   notes: string
+  routing?: 'everyone' | 'lead' | null
+  lead_member_id?: string | null
 }
 export interface GroupsContextResult {
   context: RoomContext
