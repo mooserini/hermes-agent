@@ -522,11 +522,13 @@ export class CanonicalDesktopProtocol {
   // pins priority, Normal pins normal over a profile tier, omitted inherits); `cwd_explicit` is the
   // provenance that lets a named profile's own workspace beat an inherited cwd.
   private prepareCreate(input: Record<string, unknown>): Record<string, unknown> {
-    // `room_plumbing` is the serve socket's flag for a Desktop-driven room's member session; the
-    // owner's create contract has no such field and keys the same behaviour on the hidden row plus
-    // `follow_profile_config`, which ride through unchanged.
-    const { reasoning_effort: effort, fast, service_tier: picked, room_plumbing: _roomPlumbing, ...params } = input
+    // `room_plumbing` is the serve socket's flag for a room member session: it only skips the stored
+    // runtime overrides (serve's agent_factory), which the owner calls `follow_profile_config`. It
+    // does not imply hidden there, so `hidden` stays whatever the caller sent.
+    const { reasoning_effort: effort, fast, service_tier: picked, room_plumbing: roomPlumbing, ...params } = input
     const tier = typeof picked === 'string' && picked ? picked : fast === true ? 'priority' : fast === false ? 'normal' : undefined
+
+    if (roomPlumbing === true) { params.follow_profile_config = true }
 
     if (typeof effort === 'string' && effort) { params.reasoning = effort }
 
