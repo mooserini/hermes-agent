@@ -19,6 +19,7 @@ const GET_WINDOWS_REQUIRED = [
 
 export function listAsarFiles(asarPath) {
   const raw = readFileSync(asarPath)
+  if (raw.length < 16) return []
   const candidates = [raw.readUInt32LE(12), raw.readUInt32LE(8), raw.readUInt32LE(4)]
   let header = null
   for (const size of candidates) {

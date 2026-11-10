@@ -17,6 +17,7 @@ import { copyFile, mkdir, readdir } from 'node:fs/promises'
 import { runPython } from '../../../scripts/build/python.mjs'
 
 import { assertPackagedBackendReadyArtifact, resolvePackagedAsarPath } from './backend-ready-artifact.mjs'
+import { assertDarwinGetWindowsTree, getWindowsFilesInAsar } from './assert-asar-get-windows.mjs'
 import { batchSignAppTree } from './batch-sign-binaries.mjs'
 import { rehashPayloadDigests } from './payload-digests.mjs'
 import { resolveSigningIdentity, signNestedChromium } from './sign-nested-chromium.mjs'
@@ -69,6 +70,20 @@ export default async function afterPack(context) {
   const asarPath = resolvePackagedAsarPath(context)
   assertPackagedBackendReadyArtifact(asarPath)
   console.log(`[after-pack] verified backend readiness parser in ${asarPath}`)
+  if (platform === 'darwin') {
+    // A wholly absent tree is the stager's accepted degraded shape (it warns
+    // and ships without window enumeration) — warn loudly by name and continue.
+    // A present-but-incoherent tree is a staging accident: fail the pack.
+    if (getWindowsFilesInAsar(asarPath).length === 0) {
+      console.warn(
+        `[after-pack] get-windows tree absent from ${asarPath} — shipping degraded ` +
+          `build without window enumeration (read_window_below unavailable)`
+      )
+    } else {
+      assertDarwinGetWindowsTree(asarPath)
+      console.log(`[after-pack] verified get-windows tree in ${asarPath}`)
+    }
+  }
   const resources = platform === 'darwin'
     ? path.join(context.appOutDir, `${context.packager.appInfo.productFilename}.app`, 'Contents', 'Resources')
     : path.join(context.appOutDir, 'resources')
